@@ -1,0 +1,25 @@
+defaults:
+  - inference_base
+  - _self_
+
+run_name_: ucond_60M_bb_notri
+ckpt_path: "store/train_run_8gpu_bb_run1/checkpoints"
+ckpt_name: last-EMA.ckpt
+
+self_cond: True
+
+# Lengths to sample. Uses `nres_lens` if specified, otherwise arange(min_len, max_len+1, step)
+nres_lens: [100]
+min_len:
+max_len:
+step_len:
+
+# Number of samples per protein length
+nsamples_per_len: 5
+
+sampling_caflow:
+  sampling_mode: sc  # "vf" for ODE sampling, "sc" for SDE sampling
+  sc_scale_noise: 0.45  # noise scale, used if sampling_mode == "sc"
+
+ca_only: False
+compute_designability: False

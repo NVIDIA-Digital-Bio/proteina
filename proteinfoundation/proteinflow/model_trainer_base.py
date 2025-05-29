@@ -23,6 +23,7 @@ import torch
 from jaxtyping import Bool, Float
 from loguru import logger
 from torch import Dict, Tensor
+from einops import repeat
 
 from proteinfoundation.utils.ff_utils.pdb_utils import mask_cath_code_by_level
 
@@ -160,7 +161,7 @@ class ModelTrainerBase(L.LightningModule):
                 + (1 - autoguidance_ratio) * x_pred_uncond
             )
 
-        v = self.fm.xt_dot(x_pred, batch["x_t"], batch["t"], batch["mask"])
+        v = self.fm.xt_dot(x_pred, batch["x_t"], batch["t"], batch["coords_mask"])
         return x_pred, v
 
     def on_save_checkpoint(self, checkpoint):
@@ -528,9 +529,11 @@ class ModelTrainerBase(L.LightningModule):
         gt_p: float = 1.0,
         gt_clamp_val: float = None,
         mask = None,
+        coords_mask = None,
         x_motif = None,
         fixed_sequence_mask = None,
         fixed_structure_mask = None,
+        **kwargs,
     ) -> Dict[str, Tensor]:
         """
         Generates samples by integrating ODE with learned vector field.
@@ -542,6 +545,10 @@ class ModelTrainerBase(L.LightningModule):
         )
         if mask is None:
             mask = torch.ones(nsamples, n).long().bool().to(self.device)
+        if coords_mask is None:
+            coords_mask = repeat(mask, "b n -> b (n c)", c=4)
+        if not self.ca_only:
+            n = n * 4   # nres is passed here
         return self.fm.full_simulation(
             predict_clean_n_v_w_guidance,
             dt=dt,
@@ -551,6 +558,7 @@ class ModelTrainerBase(L.LightningModule):
             cath_code=cath_code,
             device=self.device,
             mask=mask,
+            coords_mask=coords_mask,
             dtype=dtype,
             schedule_mode=schedule_mode,
             schedule_p=schedule_p,

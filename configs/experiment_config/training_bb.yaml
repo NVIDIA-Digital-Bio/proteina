@@ -1,0 +1,69 @@
+run_name_: train_run_8gpu_bb_run1
+
+hardware:
+  ncpus_per_task_train_: 24  # Number of CPUs per tast during training
+  ncpus_per_task_prepro_: 32  # Number of CPUs used for data preprocessing run
+  accelerator: gpu
+  ngpus_per_node_: 8  # Number of GPUs per node
+  nnodes_: 1  # Number of nodes
+
+# Below, for t_distribution, options are
+# - name: uniform. p2 is the maximum time that we can sample (<=1, p1 is ignored).
+# - name: logit-normal (normal + sigmoid). p1 is the mean of the normal, p2 the std (>0).
+# - name: beta. This is beta(p1, p2).
+loss:
+  t_distribution:
+    name: mix_up02_beta
+    p1: 1.9
+    p2: 1.0
+  loss_t_clamp: 0.9  # Used for loss stability in frameflow, 1. for no clamping
+  use_aux_loss: True  # Whether to use auxiliary loss
+  aux_loss_t_lim: 0.3  # Time limit to apply auxiliary loss
+  thres_aux_2d_loss: 0.6  # This is nm not Å
+  aux_loss_weight: 1.0
+  num_dist_buckets: 64  # Number of buckets to discretize the pairwise distance
+  max_dist_boundary: 1.0  # Given by nanometer
+
+
+defaults:
+  - model: bbflow  # caflow or frameflow
+  - _self_
+
+# Dataset params
+dataset: d_FS
+dataset_config_subdir: afdb
+
+force_precision_f32: False  # If false will use bf16-mixed precision
+
+training:
+  self_cond: True
+  fold_cond: False
+  mask_T_prob: 0.5
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]   # Training proportion for [None, C, CA, CAT]. If specified, will override mask_{C,A,T}_prob
+
+opt:
+  lr: 0.0001
+  max_epochs: 10000000
+  log_every_n_steps: 1  # For wandb
+  accumulate_grad_batches: 1
+  val_check_interval: 10000  # Number of training steps after which we check validation loss
+  skip_nan_grad: False  # Skip updates with nan gradient
+  grad_and_weight_analysis: False  # Log some statistics of gradients and weights
+  dist_strategy: ddp  # For multi GPU training, do not change
+
+log:
+  wandb_project: protein_transformer_bb  # Leave this so we can compare runs easily
+  log_wandb: True  # whether to log to wandb
+  checkpoint: True  # whether to store checkpoints
+  checkpoint_every_n_steps: 10000  # How often we store a checkpoint, should be greater than val_check_interval above
+  last_ckpt_every_n_steps: 3000  # How often do we update our last ckpt, needed for requeuing without losing progress
+
+seed: 42
+
+ema:
+  decay: 0.999  # 0 means no EMA, so all the EMA machinery is unused and no EMA checkpoints are stored
+  validate_original_weights: False  # Whether to run validation on regular or EMA weights
+  every_n_steps: 1  # Frequency of EMA updates
+  cpu_offload: False  # Whether to offload EMA weights to cpu

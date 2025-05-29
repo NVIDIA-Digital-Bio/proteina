@@ -10,13 +10,14 @@
 
 
 import torch
+from einops import rearrange
 
 nm_to_ang_scale = 10.0
 ang_to_nm = lambda trans: trans / nm_to_ang_scale
 nm_to_ang = lambda trans: trans * nm_to_ang_scale
 
 
-def trans_nm_to_atom37(ca_coors_nm):
+def trans_nm_to_atom37(x_coors_nm, ca_only=True):
     """
     Converts CA positions (in nm) into atom37 representation (in Å).
 
@@ -26,10 +27,10 @@ def trans_nm_to_atom37(ca_coors_nm):
     Returns:
         Coordinates in atom37 representation (in Å)
     """
-    return trans_ang_to_atom37(nm_to_ang(ca_coors_nm))
+    return trans_ang_to_atom37(nm_to_ang(x_coors_nm), ca_only=ca_only)
 
 
-def trans_ang_to_atom37(ca_coors):
+def trans_ang_to_atom37(x_coors, ca_only=True):
     """
     Converts CA positions (in Å) into atom37 representation.
 
@@ -39,10 +40,21 @@ def trans_ang_to_atom37(ca_coors):
     Returns:
         Coordinates in atom37 representation
     """
-    original_shape = ca_coors.shape  # [*, N, 3]
-    atom37_shape = list(original_shape[:-1]) + [37, original_shape[-1]]  # [*, N, 37, 3]
-    ca_coors_atom37 = torch.zeros(
-        atom37_shape, dtype=ca_coors.dtype, device=ca_coors.device
-    )  # [*, N, 37, 3]
-    ca_coors_atom37[..., 1, :] = ca_coors  # Sets correct positions for CA [*, N, 37, 3]
-    return ca_coors_atom37
+    if ca_only:
+        original_shape = x_coors.shape  # [*, N, 3]
+        atom37_shape = list(original_shape[:-1]) + [37, original_shape[-1]]  # [*, N, 37, 3]
+        x_coors_atom37 = torch.zeros(
+            atom37_shape, dtype=x_coors.dtype, device=x_coors.device
+        )  # [*, N, 37, 3]
+        x_coors_atom37[..., 1, :] = x_coors  # Sets correct positions for CA [*, N, 37, 3]
+    else:
+        x_coors = rearrange(x_coors, "b (n c) d -> b n c d", n=int(x_coors.shape[-2] / 4))  # [*, N, 4, 3]
+        original_shape = x_coors.shape  # [*, N, 3]
+        atom37_shape = list(original_shape[:-2]) + [37, original_shape[-1]]  # [*, N, 37, 3]
+        x_coors_atom37 = torch.zeros(
+            atom37_shape, dtype=x_coors.dtype, device=x_coors.device
+        )  # [*, N, 37, 3]
+        BB_INDEX = [0, 1, 2, 4]
+        x_coors_atom37[..., BB_INDEX, :] = x_coors  # Sets correct positions for CA [*, N, 37, 3]
+        # x_coors_atom37[..., 1, :] = x_coors[..., 1, :]  # Sets correct positions for CA [*, N, 37, 3]
+    return x_coors_atom37

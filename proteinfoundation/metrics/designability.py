@@ -216,7 +216,7 @@ def run_and_store_esm(
     # Store generations for each sequence
     out_esm_paths = []
     for i, pdb in enumerate(list_of_strings_pdb):
-        fname = f"esm_{i+1}.pdb_esm"
+        fname = f"esm_{i+1}.pdb"
         fdir = os.path.join(path_to_esmfold_out, fname)
         with open(fdir, "w") as f:
             f.write(pdb)
@@ -266,7 +266,12 @@ def rmsd_metric(
         assert mask_1_atom_37.shape == coors_1_atom37.shape[1:]
     if mask_2_atom_37 is not None:
         assert mask_2_atom_37.shape == coors_2_atom37.shape[1:]
-    idx_select = [1]  # [CA]
+    if mode == "ca":
+        idx_select = [1]  # [CA]
+    elif mode == "backbone":
+        idx_select = [0, 1, 2]
+    else:
+        raise ValueError(f"Invalid mode: {mode}")
 
     coors_1 = coors_1_atom37[:, idx_select, :]  # [n, natoms_sel, 3]
     coors_2 = coors_2_atom37[:, idx_select, :]  # [n, natoms_sel, 3]
@@ -294,6 +299,7 @@ def scRMSD(
     num_seq_per_target: int = 8,
     pmpnn_sampling_temp: float = 0.1,
     ret_min=True,
+    ca_only=True,
 ) -> Union[float, List[float]]:
     """
     Evaluates self-consistency RMSD metrics for given pdb.
@@ -317,6 +323,7 @@ def scRMSD(
         tmp_path,
         num_seq_per_target=num_seq_per_target,
         sampling_temp=pmpnn_sampling_temp,
+        ca_only=ca_only,
     )  # List of sequences
 
     logger.info(f"Running ESMFold for {name}")

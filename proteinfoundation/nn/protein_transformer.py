@@ -9,12 +9,16 @@
 # its affiliates is strictly prohibited.
 
 
-from typing import Dict
+from typing import Dict, Optional, Union
 
 import einops
+import einops.layers
+import einops.layers.torch
+import math
 import torch
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-
+from functools import partial
 from openfold.model.msa import MSARowAttentionWithPairBias
 from openfold.model.pair_transition import PairTransition
 from openfold.model.structure_module import InvariantPointAttention
@@ -29,6 +33,12 @@ from proteinfoundation.nn.alphafold3_pytorch_utils.modules import (
     AdaptiveLayerNorm,
     AdaptiveLayerNormOutputScale,
     Transition,
+)
+from proteinfoundation.nn.alphafold3_pytorch_utils.utils import (
+    rearrange_qk_to_dense_trunk,
+    broadcast_token_to_local_atom_pair,
+    broadcast_token_to_atom,
+    aggregate_atom_to_token,
 )
 
 
@@ -171,7 +181,7 @@ class MultiHeadBiasedAttentionADALN_MM(torch.nn.Module):
     """Pair biased multi-head self-attention with adaptive layer norm applied to input
     and adaptive scaling applied to output."""
 
-    def __init__(self, dim_token, dim_pair, nheads, dim_cond, use_qkln):
+    def __init__(self, dim_token, dim_pair, nheads, dim_cond, use_qkln, apply_rotary):
         super().__init__()
         dim_head = int(dim_token // nheads)
         self.adaln = AdaptiveLayerNorm(dim=dim_token, dim_cond=dim_cond)
@@ -183,12 +193,22 @@ class MultiHeadBiasedAttentionADALN_MM(torch.nn.Module):
             dim_out=dim_token,
             qkln=use_qkln,
             pair_dim=dim_pair,
+            apply_rotary=apply_rotary
         )
         self.scale_output = AdaptiveLayerNormOutputScale(
             dim=dim_token, dim_cond=dim_cond
         )
 
-    def forward(self, x, pair_rep, cond, mask):
+    def forward(
+        self,
+        x,
+        pair_rep,
+        cond,
+        mask,
+        pair_mask,
+        n_queries,
+        n_keys
+    ):
         """
         Args:
             x: Input sequence representation, shape [b, n, dim_token]
@@ -199,9 +219,14 @@ class MultiHeadBiasedAttentionADALN_MM(torch.nn.Module):
         Returns:
             Updated sequence representation, shape [b, n, dim_token].
         """
-        pair_mask = mask[:, :, None] * mask[:, None, :]  # [b, n, n]
         x = self.adaln(x, cond, mask)
-        x = self.mha(node_feats=x, pair_feats=pair_rep, mask=pair_mask)
+        x = self.mha(
+            node_feats=x,
+            pair_feats=pair_rep,
+            mask=pair_mask,
+            n_queries=n_queries,
+            n_keys=n_keys
+        )
         x = self.scale_output(x, cond, mask)
         return x * mask[..., None]
 
@@ -262,6 +287,7 @@ class MultiheadAttnAndTransition(torch.nn.Module):
         parallel_mha_transition,
         use_attn_pair_bias,
         use_qkln,
+        apply_rotary,
         dropout=0.0,
         expansion_factor=4,
     ):
@@ -282,14 +308,15 @@ class MultiheadAttnAndTransition(torch.nn.Module):
             nheads=nheads,
             dim_cond=dim_cond,
             use_qkln=use_qkln,
+            apply_rotary=apply_rotary
         )
 
         self.transition = TransitionADALN(
             dim=dim_token, dim_cond=dim_cond, expansion_factor=expansion_factor
         )
 
-    def _apply_mha(self, x, pair_rep, cond, mask):
-        x_attn = self.mhba(x, pair_rep, cond, mask)
+    def _apply_mha(self, x, pair_rep, cond, mask, pair_mask, n_queries, n_keys):
+        x_attn = self.mhba(x, pair_rep, cond, mask, pair_mask, n_queries, n_keys)
         if self.residual_mha:
             x_attn = x_attn + x
         return x_attn * mask[..., None]
@@ -300,7 +327,7 @@ class MultiheadAttnAndTransition(torch.nn.Module):
             x_tr = x_tr + x
         return x_tr * mask[..., None]
 
-    def forward(self, x, pair_rep, cond, mask):
+    def forward(self, x, pair_rep, cond, mask, pair_mask=None, n_queries=None, n_keys=None):
         """
         Args:
             x: Input sequence representation, shape [b, n, dim_token]
@@ -313,11 +340,11 @@ class MultiheadAttnAndTransition(torch.nn.Module):
         """
         x = x * mask[..., None]
         if self.parallel:
-            x = self._apply_mha(x, pair_rep, cond, mask) + self._apply_transition(
+            x = self._apply_mha(x, pair_rep, cond, mask, pair_mask, n_queries, n_keys) + self._apply_transition(
                 x, cond, mask
             )
         else:
-            x = self._apply_mha(x, pair_rep, cond, mask)
+            x = self._apply_mha(x, pair_rep, cond, mask, pair_mask, n_queries, n_keys)
             x = self._apply_transition(x, cond, mask)
         return x * mask[..., None]
 
@@ -434,6 +461,351 @@ class PairReprBuilder(torch.nn.Module):
         return repr
 
 
+class AtomAttentionEncoder(torch.nn.Module):
+    """
+    Encoder for atom attention.
+    """
+    def __init__(
+        self,
+        atom_dim: int,
+        atom_dim_pair: int,
+        token_dim: int,
+        pair_repr_dim: int,
+        dim_cond: int,
+        n_queries: int = 32,
+        n_keys: int = 128,
+        n_layers: int = 2,
+        nheads: int = 4,
+        use_qkln: bool = True,
+        apply_rotary: bool = False,
+        ref_pos_augment: bool = False,
+        **kwargs,
+    ):
+        super(AtomAttentionEncoder, self).__init__()
+        
+        self.atom_dim = atom_dim
+        self.atom_dim_pair = atom_dim_pair
+        self.token_dim = token_dim
+        self.pair_repr_dim = pair_repr_dim
+        self.dim_cond = dim_cond
+        self.n_queries = n_queries
+        self.n_keys = n_keys
+        self.n_layers = n_layers
+        self.nheads = nheads
+        self.use_qkln = use_qkln
+        
+        self.ref_pos = torch.tensor(
+            [
+                [ 0.8053, -1.9707, -1.4140],
+                [ 0.7207, -0.5147, -1.3373],
+                [-0.0555, -0.0849, -0.1298],
+                [ 0.5367,  0.1090,  0.9654],
+            ],
+            dtype=torch.float,
+        )  # [N, CA, C, O]
+        self.ref_element = F.one_hot(torch.tensor(
+            [
+                6, 5, 5, 7
+            ],
+            dtype=torch.long,
+        ), num_classes=10).float()  # [N, CA, C, O]
+        self.ref_charge = torch.tensor(
+            [
+                [0], [0], [0], [0]
+            ],
+            dtype=torch.float,
+        )  # [N, CA, C, O]
+        self.ref_mask = torch.tensor(
+            [
+                [1], [1], [1], [1]
+            ],
+            dtype=torch.float,
+        )  # [N, CA, C, O]
+        self.input_feature = {
+            "ref_pos": 3,
+            "ref_charge": 1,
+            "ref_mask": 1,
+            "ref_element": 10,
+        }
+        
+        self.linear_no_bias_f = torch.nn.Linear(
+            sum(self.input_feature.values()), atom_dim, bias=False
+        )
+        self.linear_no_bias_d = torch.nn.Linear(
+            3, atom_dim_pair, bias=False
+        )
+        self.linear_no_bias_invd = torch.nn.Linear(
+            1, atom_dim_pair, bias=False
+        )
+        
+        self.linear_no_bias_v = torch.nn.Linear(
+            1, atom_dim_pair, bias=False
+        )
+        self.layernorm_c = torch.nn.LayerNorm(dim_cond)
+        self.linear_no_bias_c = torch.nn.Linear(
+            dim_cond, atom_dim, bias=False
+        )
+        self.layernorm_z = torch.nn.LayerNorm(pair_repr_dim)  # memory bottleneck
+        self.linear_no_bias_z = torch.nn.Linear(
+            pair_repr_dim, atom_dim_pair, bias=False
+        )
+        self.linear_3d_embed = torch.nn.Linear(
+            3, atom_dim, bias=False
+        )
+        self.linear_no_bias_cl = torch.nn.Linear(
+            atom_dim, atom_dim_pair, bias=False
+        )
+        self.linear_no_bias_cm = torch.nn.Linear(
+            atom_dim, atom_dim_pair, bias=False
+        )
+        self.small_mlp = torch.nn.Sequential(
+            torch.nn.ReLU(),
+            torch.nn.Linear(atom_dim_pair, atom_dim_pair, bias=False),
+            torch.nn.ReLU(),
+            torch.nn.Linear(atom_dim_pair, atom_dim_pair, bias=False),
+            torch.nn.ReLU(),
+            torch.nn.Linear(atom_dim_pair, atom_dim_pair, bias=False),
+        )
+        self.linear_no_bias_q = torch.nn.Linear(
+            atom_dim, token_dim, bias=False
+        )
+        self.transformer_layers = torch.nn.ModuleList([
+            MultiheadAttnAndTransition(
+                dim_token=atom_dim,
+                dim_pair=atom_dim_pair,
+                nheads=nheads,
+                dim_cond=atom_dim,
+                residual_mha=True,
+                residual_transition=True,
+                parallel_mha_transition=False,
+                use_attn_pair_bias=True,
+                use_qkln=use_qkln,
+                apply_rotary=apply_rotary
+            )
+            for _ in range(n_layers)
+        ])
+    
+    def forward(self, coors_3d, pair_repr, cond, coors_mask, mask):
+        b, n_atoms = coors_3d.shape[:2]
+        n_tokens = n_atoms // 4
+        assert n_tokens == mask.shape[1]
+        device = coors_3d.device
+        
+        # Expand ref features to match batch size
+        expand_ref_feats = partial(einops.repeat, pattern="n c -> b (a n) c", b=b, a=n_tokens)
+        (
+            ref_pos,
+            ref_charge,
+            ref_mask,
+            ref_element,
+        ) = map(expand_ref_feats, (
+            self.ref_pos,
+            self.ref_charge,
+            self.ref_mask,
+            self.ref_element,
+        ))
+        ref_feats_to_device = lambda x: x.to(device)
+        (
+            ref_pos,
+            ref_charge,
+            ref_mask,
+            ref_element,
+        ) = map(ref_feats_to_device, (
+            ref_pos,
+            ref_charge,
+            ref_mask,
+            ref_element,
+        ))
+        ref_space_uid = einops.repeat(torch.arange(n_tokens, device=device), "n -> b (n c)", b=b, c=4)
+        atom_to_token_idx = ref_space_uid.clone()
+        
+        # Embed input features
+        c_l= torch.cat(
+            [
+                ref_pos,
+                ref_charge,
+                ref_mask,
+                ref_element,
+            ],
+            dim=-1
+        ).to(device) * coors_mask[..., None]
+        c_l = self.linear_no_bias_f(c_l)
+        
+        # Prepare tensors in dense trunks for local operations
+        q_trunked_list, k_trunked_list, pad_info = rearrange_qk_to_dense_trunk(
+            q=[ref_pos, ref_space_uid, coors_mask],
+            k=[ref_pos, ref_space_uid, coors_mask],
+            dim_q=[-2, -1, -1],
+            dim_k=[-2, -1, -1],
+            n_queries=self.n_queries,
+            n_keys=self.n_keys,
+            compute_mask=True,
+        )
+        
+        # Compute atom pair feature
+        pair_mask = (
+            q_trunked_list[2][..., None] * k_trunked_list[2][..., None, :]
+        ) * pad_info["mask_trunked"] # [..., n_blocks, n_queries, n_keys]
+        d_lm = (
+            q_trunked_list[0][..., None, :] - k_trunked_list[0][..., None, :, :]
+        ) * pair_mask[..., None]  # [..., n_blocks, n_queries, n_keys, 3]
+        v_lm = (
+            q_trunked_list[1][..., None].int() == k_trunked_list[1][..., None, :].int()
+        ).unsqueeze(
+            dim=-1
+        ) * pair_mask[..., None]  # [..., n_blocks, n_queries, n_keys, 1]
+        
+        p_lm = (self.linear_no_bias_d(d_lm) * v_lm) * pad_info[
+            "mask_trunked"
+        ].unsqueeze(
+            dim=-1
+        ) * pair_mask[..., None]  # [..., n_blocks, n_queries, n_keys, C_atompair]
+        
+        p_lm = (
+            p_lm
+            + self.linear_no_bias_invd(
+                1 / (1 + (d_lm**2).sum(dim=-1, keepdim=True))
+            )
+            * v_lm
+        )
+        p_lm = p_lm + self.linear_no_bias_v(v_lm.to(dtype=p_lm.dtype)) * v_lm
+        
+        q_l = c_l.clone()
+        
+        c_l = c_l + self.linear_no_bias_c(
+            self.layernorm_c(
+                broadcast_token_to_atom(
+                    x_token=cond, atom_to_token_idx=atom_to_token_idx
+                )
+            )
+        )  # [..., N_atom, c_atom]
+        
+        z_local_pairs, _ = broadcast_token_to_local_atom_pair(
+            z_token=pair_repr,
+            atom_to_token_idx=atom_to_token_idx,
+            n_queries=self.n_queries,
+            n_keys=self.n_keys,
+            compute_mask=False,
+        )  # [..., n_blocks, n_queries, n_keys, c_z]
+        z_local_pairs = z_local_pairs * pair_mask[..., None]
+        
+        p_lm = p_lm + self.linear_no_bias_z(
+            self.layernorm_z(z_local_pairs)
+        )  # [..., n_blocks, n_queries, n_keys, c_atompair]
+
+        # Add the noisy positions
+        q_l = q_l + self.linear_3d_embed(
+            coors_3d
+        ) * coors_mask[..., None]  # [..., N_atom, c_atom]
+        
+        # Add the combined single conditioning to the pair representation
+        c_l_q, c_l_k, _ = rearrange_qk_to_dense_trunk(
+            q=c_l,
+            k=c_l,
+            dim_q=-2,
+            dim_k=-2,
+            n_queries=self.n_queries,
+            n_keys=self.n_keys,
+            compute_mask=False,
+        )
+        
+        p_lm = (
+            p_lm
+            + self.linear_no_bias_cl(F.relu(c_l_q[..., None, :]))
+            + self.linear_no_bias_cm(F.relu(c_l_k[..., None, :, :]))
+        )  # [..., n_blocks, n_queries, n_keys, c_atompair]
+
+        # Run a small MLP on the pair activations
+        p_lm = p_lm + self.small_mlp(p_lm)
+        
+        for layer in self.transformer_layers:
+            q_l = layer(q_l, p_lm, c_l, coors_mask, pair_mask, self.n_queries, self.n_keys)
+        
+        # Aggregate per-atom representation to per-token representation
+        a = aggregate_atom_to_token(
+            x_atom=F.relu(self.linear_no_bias_q(q_l)) * coors_mask[..., None],
+            atom_to_token_idx=atom_to_token_idx,
+            n_token=n_tokens,
+            reduce="mean",
+        )
+        
+        return a, q_l, c_l, p_lm, pair_mask
+    
+    
+class AtomAttentionDecoder(torch.nn.Module):
+    """
+    Decoder for atom attention.
+    """
+    def __init__(
+        self,
+        atom_dim: int,
+        atom_dim_pair: int,
+        token_dim: int,
+        dim_cond: int,
+        n_queries: int = 32,
+        n_keys: int = 128,
+        n_layers: int = 2,
+        nheads: int = 4,
+        use_qkln: bool = True,
+        apply_rotary: bool = False,
+        **kwargs,
+    ):
+        super(AtomAttentionDecoder, self).__init__()
+        
+        self.atom_dim = atom_dim
+        self.atom_dim_pair = atom_dim_pair
+        self.token_dim = token_dim
+        self.dim_cond = dim_cond
+        self.n_queries = n_queries
+        self.n_keys = n_keys
+        self.n_layers = n_layers
+        self.nheads = nheads
+        self.use_qkln = use_qkln
+
+        self.linear_no_bias_a = torch.nn.Linear(
+            token_dim, atom_dim, bias=False
+        )
+        self.layernorm_q = torch.nn.LayerNorm(atom_dim)
+        self.linear_no_bias_out = torch.nn.Linear(
+            atom_dim, 3, bias=False
+        )
+        
+        self.transformer_layers = torch.nn.ModuleList([
+            MultiheadAttnAndTransition(
+                dim_token=atom_dim,
+                dim_pair=atom_dim_pair,
+                nheads=nheads,
+                dim_cond=atom_dim,
+                residual_mha=True,
+                residual_transition=True,
+                parallel_mha_transition=False,
+                use_attn_pair_bias=True,
+                use_qkln=use_qkln,
+                apply_rotary=apply_rotary,
+            ) for _ in range(n_layers)
+        ])
+        
+    def forward(self, a, q_skip, c_skip, p_skip, coors_mask, pair_mask):
+        b, n_tokens = a.shape[:2]
+        n_atoms = n_tokens * 4
+        device = a.device
+        atom_to_token_idx = einops.repeat(torch.arange(n_tokens, device=device), "n -> (n c)", c=4)
+        q = (
+            self.linear_no_bias_a(
+                broadcast_token_to_atom(
+                    x_token=a, atom_to_token_idx=atom_to_token_idx
+                )  # [..., N_atom, c_token]
+            )  # [..., N_atom, c_atom]
+            + q_skip
+        ) * coors_mask[..., None]
+        
+        for layer in self.transformer_layers:
+            q = layer(q, p_skip, c_skip, coors_mask, pair_mask, self.n_queries, self.n_keys)
+
+        r = self.linear_no_bias_out(self.layernorm_q(q)) * coors_mask[..., None]
+        
+        return r
+
 class ProteinTransformerAF3(torch.nn.Module):
     """
     Final neural network mimicking the one used in AF3 diffusion. It consists of:
@@ -456,6 +828,8 @@ class ProteinTransformerAF3(torch.nn.Module):
         Initializes the NN. The seqs and pair representations used are just zero in case
         no features are required."""
         super(ProteinTransformerAF3, self).__init__()
+        self.module_type = kwargs.get("module_type", "decoder")
+        self.ca_only = kwargs.get("ca_only", True)
         self.use_attn_pair_bias = kwargs["use_attn_pair_bias"]
         self.nlayers = kwargs["nlayers"]
         self.token_dim = kwargs["token_dim"]
@@ -473,9 +847,12 @@ class ProteinTransformerAF3(torch.nn.Module):
         self.use_tri_mult = kwargs.get("use_tri_mult", False)
         self.feats_pair_cond = kwargs.get("feats_pair_cond", [])
         self.use_qkln = kwargs.get("use_qkln", False)
+        self.apply_rotary = kwargs.get("apply_rotary", False)
         self.num_buckets_predict_pair = kwargs.get(
             "num_buckets_predict_pair", None
         )
+        self.sampling_ratio = kwargs.get("sampling_ratio", 1)
+        self.dim_latent = kwargs.get("dim_latent", None)
 
         # Registers
         self.num_registers = kwargs.get("num_registers", None)
@@ -489,7 +866,15 @@ class ProteinTransformerAF3(torch.nn.Module):
             )
 
         # To encode corrupted 3d positions
-        self.linear_3d_embed = torch.nn.Linear(3, kwargs["token_dim"], bias=False)
+        if not self.ca_only:
+            self.atom_encoder = AtomAttentionEncoder(
+                **kwargs.get("atom_encoder", {}),
+                token_dim=kwargs["token_dim"],
+                dim_cond=kwargs["dim_cond"],
+                pair_repr_dim=kwargs["pair_repr_dim"],
+            )
+        else:
+            self.linear_3d_embed = torch.nn.Linear(3, kwargs["token_dim"], bias=False)
 
         # To form initial representation
         self.init_repr_factory = FeatureFactory(
@@ -538,6 +923,7 @@ class ProteinTransformerAF3(torch.nn.Module):
                     parallel_mha_transition=kwargs["parallel_mha_transition"],
                     use_attn_pair_bias=kwargs["use_attn_pair_bias"],
                     use_qkln=self.use_qkln,
+                    apply_rotary=self.apply_rotary,
                 )
                 for _ in range(self.nlayers)
             ]
@@ -567,11 +953,25 @@ class ProteinTransformerAF3(torch.nn.Module):
                         kwargs["pair_repr_dim"], self.num_buckets_predict_pair
                     ),
                 )
-
-        self.coors_3d_decoder = torch.nn.Sequential(
-            torch.nn.LayerNorm(kwargs["token_dim"]),
-            torch.nn.Linear(kwargs["token_dim"], 3, bias=False),
-        )
+        
+        if self.ca_only:
+            self.coors_3d_decoder = torch.nn.Sequential(
+                torch.nn.LayerNorm(kwargs["token_dim"]),
+                torch.nn.Linear(kwargs["token_dim"], 3, bias=False),
+            )
+        else:
+            self.coors_3d_decoder = AtomAttentionDecoder(
+                **kwargs.get("atom_decoder", {}),
+                token_dim=kwargs["token_dim"],
+                dim_cond=kwargs["dim_cond"],
+                pair_repr_dim=kwargs["pair_repr_dim"],
+            )
+            
+    def _set_registers(self, registers):
+        self.num_registers = registers.shape[1]
+        # Delete the old registers
+        del self.registers
+        self.register_buffer("registers", registers, persistent=False)
 
     def _extend_w_registers(self, seqs, pair, mask, cond_seq):
         """
@@ -656,25 +1056,30 @@ class ProteinTransformerAF3(torch.nn.Module):
         Returns:
             Predicted clean coordinates, shape [b, n, 3].
         """
-        mask = batch_nn["mask"]
+        mask, coords_mask = batch_nn["mask"], batch_nn["coords_mask"]
 
         # Conditioning variables
         c = self.cond_factory(batch_nn)  # [b, n, dim_cond]
         c = self.transition_c_2(self.transition_c_1(c, mask), mask)  # [b, n, dim_cond]
 
         # Prepare input - coordinates and initial sequence representation from features
-        coors_3d = batch_nn["x_t"] * mask[..., None]  # [b, n, 3]
-        coors_embed = (
-            self.linear_3d_embed(coors_3d) * mask[..., None]
-        )  # [b, n, token_dim]
-        seq_f_repr = self.init_repr_factory(batch_nn)  # [b, n, token_dim]
-        seqs = coors_embed + seq_f_repr  # [b, n, token_dim]
-        seqs = seqs * mask[..., None]  # [b, n, token_dim]
-
+        coors_3d = batch_nn["x_t"] * coords_mask[..., None]  # [b, n, 3]
+        
         # Pair representation
         pair_rep = None
         if self.use_attn_pair_bias:
             pair_rep = self.pair_repr_builder(batch_nn)  # [b, n, n, pair_dim]
+        
+        if not self.ca_only:
+            coors_embed, q_skip, c_skip, p_skip, pair_mask = self.atom_encoder(coors_3d, pair_rep, c, coords_mask, mask)
+        else:
+            coors_embed = (
+                self.linear_3d_embed(coors_3d) * coords_mask[..., None]
+            )  # [b, n, token_dim]
+        
+        seq_f_repr = self.init_repr_factory(batch_nn)  # [b, n, token_dim]
+        seqs = coors_embed + seq_f_repr  # [b, n, token_dim]
+        seqs = seqs * mask[..., None]  # [b, n, token_dim]
 
         # Apply registers
         seqs, pair_rep, mask, c = self._extend_w_registers(seqs, pair_rep, mask, c)
@@ -696,14 +1101,24 @@ class ProteinTransformerAF3(torch.nn.Module):
         seqs, pair_rep, mask = self._undo_registers(seqs, pair_rep, mask)
 
         # Get final coordinates
-        final_coors = self.coors_3d_decoder(seqs) * mask[..., None]  # [b, n, 3]
+        if self.ca_only:
+            final_coors = self.coors_3d_decoder(seqs) # [b, n, 3]
+        else:
+            final_coors = self.coors_3d_decoder(
+                seqs,
+                q_skip,
+                c_skip,
+                p_skip,
+                coords_mask,
+                pair_mask
+            ) # [b, n, 3]
         nn_out = {}
         if self.update_pair_repr and self.num_buckets_predict_pair is not None:
             pair_pred = self.pair_head_prediction(pair_rep)
             final_coors = (
                 final_coors + torch.mean(pair_pred) * 0.0
             )  # Does not affect loss but pytorch does not complain for unused params
-            final_coors = final_coors * mask[..., None]
+            final_coors = final_coors * coords_mask[..., None]
             nn_out["pair_pred"] = pair_pred
         nn_out["coors_pred"] = final_coors
         return nn_out

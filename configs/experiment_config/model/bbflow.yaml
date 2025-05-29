@@ -1,0 +1,46 @@
+name: bbflow
+
+defaults:
+  - _self_
+  - nn: bb_af3_60M_notri
+
+target_pred: v
+
+augmentation:
+  global_rotation: true  # Whether to augment samples with random rotation
+  naug_rot: 1  # How many augmentations to apply per sample (batch size increases by this factor...)
+
+validation:
+  temp_05:
+    sampling_mode: sc  # Options are: vf (plain fow matching) or sc (using score, where parameters below matter)
+    sc_scale_noise: 0.4  # scale used to multiply noise if mode == sc
+    sc_scale_score: 1.0  # scale used to multiply score if mode == sc
+    gt_mode: "1/t"  # us, tan, or 1/t
+    gt_p: 1.0  # float
+    gt_clamp_val: null  # 10.0 float or null
+  ode:
+    sampling_mode: vf
+    sc_scale_noise: 0.0
+    sc_scale_score: 0.0
+    gt_mode: "1/t"  # us, tan, or 1/t
+    gt_p: 1.0  # float
+    gt_clamp_val: null  # 10.0 float or null
+  temp_035:
+    sampling_mode: sc
+    sc_scale_noise: 0.35
+    sc_scale_score: 1.0
+    gt_mode: "1/t"  # us, tan, or 1/t
+    gt_p: 1.0  # float
+    gt_clamp_val: null  # 10.0 float or null
+
+ca_only: false
+
+# The ODE to sample flow matching is given by [dx_t = v(x_t, t) dt].
+# The SDE [dx_t = v(x_t, t) dt + g_t * s(x_t, t) dt + \sqrt(2 g_t) dw_t]
+# produces the same marginal distributions for any g_t.
+# The parameters from above are:
+#   - sampling_mode: vf or sc, corresponding to ODE or SDE
+#   - sc_scale_noise: Changes the noise term in the SDE as \sqrt(2 g_t) -> \sqrt(2 g_t * sc_scale_noise)
+#   - sc_scale_score: Changes the score term in the SDE as g_t * s(x_t, t) -> g_t * s(x_t, t) * sc_scale_score
+#   - sc_g: Sets the g_t. Specifically, we have g_t = sc_g * min(5, (1-t)/t), where the t dependency comes
+#   from the optimal transport coupling.

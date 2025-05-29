@@ -3,7 +3,7 @@ datamodule:
   data_dir: ${oc.env:DATA_PATH}/d_FS/ # Directory where the dataset is stored
   in_memory: False
   format: "pdb" # Format of your data files
-  overwrite: True # Whether to overwrite existing dataset files and reprocess the raw data
+  overwrite: False # Whether to overwrite existing dataset files and reprocess the raw data
   # arguments for BaseLightningDataModule class
   batch_padding: True # whether we want a sparse PyG batch or a padded dense batch
   sampling_mode: "random" # sample randomly from the whole dataset during training

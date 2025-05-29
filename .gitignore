@@ -23,3 +23,5 @@ wandb/
 tmp/*
 *.fasta
 inference/*
+store/*
+*.egg-info

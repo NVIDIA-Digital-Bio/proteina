@@ -16,6 +16,7 @@ import random
 from typing import Dict, List, Literal
 
 import torch
+from einops import rearrange
 from loguru import logger
 from torch.nn import functional as F
 from torch_scatter import scatter_mean
@@ -120,12 +121,12 @@ class ZeroFeat(Feature):
         self.mode = mode
 
     def forward(self, batch):
-        xt = batch["x_t"]  # [b, n, 3]
-        b, n = xt.shape[0], xt.shape[1]
+        mask = batch["mask"]  # [b, n]
+        b, n = mask.shape[0], mask.shape[1]
         if self.mode == "seq":
-            return torch.zeros((b, n, self.dim), device=xt.device)
+            return torch.zeros((b, n, self.dim), device=mask.device)
         elif self.mode == "pair":
-            torch.zeros((b, n, n, self.dim_feats_out), device=xt.device)
+            return torch.zeros((b, n, n, self.dim_feats_out), device=mask.device)
         else:
             raise IOError(f"Mode {self.mode} wrong for zero feature")
 
@@ -262,9 +263,9 @@ class FoldEmbeddingSeqFeat(Feature):
         return results, mask
 
     def forward(self, batch):
-        xt = batch["x_t"]  # [b, n, 3]
-        bs = xt.shape[0]
-        n = xt.shape[1]
+        mask = batch["mask"]  # [b, n]
+        bs = mask.shape[0]
+        n = mask.shape[1]
         if "cath_code" not in batch:
             cath_code = [
                 ["x.x.x.x"]
@@ -327,8 +328,8 @@ class TimeEmbeddingSeqFeat(Feature):
 
     def forward(self, batch):
         t = batch["t"]  # [b]
-        xt = batch["x_t"]  # [b, n, 3]
-        n = xt.shape[1]
+        mask = batch["mask"]  # [b, n]
+        n = mask.shape[1]
         t_emb = get_time_embedding(t, edim=self.dim)  # [b, t_emb_dim]
         t_emb = t_emb[:, None, :]  # [b, 1, t_emb_dim]
         return t_emb.expand((t_emb.shape[0], n, t_emb.shape[2]))  # [b, n, t_emb_dim]
@@ -342,8 +343,8 @@ class TimeEmbeddingPairFeat(Feature):
 
     def forward(self, batch):
         t = batch["t"]  # [b]
-        xt = batch["x_t"]  # [b, n, 3]
-        n = xt.shape[1]
+        mask = batch["mask"]  # [b, n]
+        n = mask.shape[1]
         t_emb = get_time_embedding(t, edim=self.dim)  # [b, t_emb_dim]
         t_emb = t_emb[:, None, None, :]  # [b, 1, 1, t_emb_dim]
         return t_emb.expand((t_emb.shape[0], n, n, t_emb.shape[3]))  # [b, n, t_emb_dim]
@@ -362,11 +363,12 @@ class IdxEmbeddingSeqFeat(Feature):
             inds = indices_force_start_w_one(inds, batch["mask"])
         else:
             self.assert_defaults_allowed(batch, "Residue index sequence")
-            xt = batch["x_t"]  # [b, n, 3]
-            b, n = xt.shape[0], xt.shape[1]
-            inds = torch.Tensor([[i + 1 for i in range(n)] for _ in range(b)]).to(
-                xt.device
+            mask = batch["mask"]  # [b, n]
+            b, n = mask.shape[0], mask.shape[1]
+            inds = torch.Tensor([[i + 1 for i in range(n)] for _ in range(b)]).long().to(
+                mask.device
             )  # [b, n]
+        
         return get_index_embedding(inds, edim=self.dim)  # [b, n, idx_embed_dim]
 
 
@@ -382,9 +384,9 @@ class ChainBreakPerResidueSeqFeat(Feature):
             chain_breaks = batch["chain_breaks_per_residue"] * 1.0  # [b, n]
         else:
             self.assert_defaults_allowed(batch, "Chain break sequence")
-            xt = batch["x_t"]  # [b, n, 3]
-            b, n = xt.shape[0], xt.shape[1]
-            chain_breaks = torch.zeros((b, n), device=xt.device) * 1.0  # [b, n]
+            mask = batch['mask']  # [b, n]
+            b, n = mask.shape[0], mask.shape[1]
+            chain_breaks = torch.zeros((b, n), device=mask.device) * 1.0  # [b, n]
         return chain_breaks[..., None]  # [b, n, 1]
 
 
@@ -399,9 +401,9 @@ class XscSeqFeat(Feature):
             return batch["x_sc"]  # [b, n, 3]
         else:
             # If we do not provide self-conditioning as input to the nn
-            x = batch["x_t"]
-            b, n = x.shape[0], x.shape[1]
-            return torch.zeros(b, n, 3, device=x.device)
+            mask = batch["mask"]  # [b, n]
+            b, n = mask.shape[0], mask.shape[1]
+            return torch.zeros(b, n, 3, device=mask.device)
 
 
 class MotifX1SeqFeat(Feature):
@@ -485,10 +487,10 @@ class SequenceSeparationPairFeat(Feature):
             inds = batch["residue_pdb_idx"]  # [b, n]
         else:
             self.assert_defaults_allowed(batch, "Relative sequence separation pair")
-            xt = batch["x_t"]  # [b, n, 3]
-            b, n = xt.shape[0], xt.shape[1]
+            mask = batch["mask"]  # [b, n]
+            b, n = mask.shape[0], mask.shape[1]
             inds = torch.Tensor([[i + 1 for i in range(n)] for _ in range(b)]).to(
-                xt.device
+                mask.device
             )  # [b, n]
 
         seq_sep = inds[:, :, None] - inds[:, None, :]  # [b, n, n]
@@ -508,6 +510,39 @@ class SequenceSeparationPairFeat(Feature):
         return bin_and_one_hot(seq_sep, bin_limits)  # [b, n, n, seq_sep_dim]
 
 
+# class SequenceSeparationPairFeat(Feature):
+#     """Computes sequence separation and returns feature of shape [b, n, n, seq_sep_dim]."""
+
+#     def __init__(self, seq_sep_dim, **kwargs):
+#         super().__init__(dim=seq_sep_dim)
+        
+#         self.r_max = 32
+#         self.s_max = 2
+#         assert seq_sep_dim == 2 * (self.r_max + 1)
+
+#     def forward(self, batch):
+#         if "residue_pdb_idx" in batch:
+#             # no need to force 1 since taking difference
+#             inds = batch["residue_pdb_idx"]  # [b, n]
+#         else:
+#             self.assert_defaults_allowed(batch, "Relative sequence separation pair")
+#             mask = batch["mask"]  # [b, n]
+#             b, n = mask.shape[0], mask.shape[1]
+#             inds = torch.Tensor([[i + 1 for i in range(n)] for _ in range(b)]).long().to(
+#                 mask.device
+#             )  # [b, n]
+
+#         d_residue = torch.clip(
+#             input=inds[:, :, None] - inds[:, None, :] + self.r_max,
+#             min=0,
+#             max=2 * self.r_max
+#         )
+
+#         a_rel_pos = F.one_hot(d_residue, 2 * (self.r_max + 1))
+        
+#         return a_rel_pos
+
+
 class XtPairwiseDistancesPairFeat(Feature):
     """Computes pairwise distances and returns feature of shape [b, n, n, dim_pair_dist]."""
 
@@ -515,10 +550,19 @@ class XtPairwiseDistancesPairFeat(Feature):
         super().__init__(dim=xt_pair_dist_dim)
         self.min_dist = xt_pair_dist_min
         self.max_dist = xt_pair_dist_max
+        self.ca_only = kwargs.get("ca_only", False)
 
     def forward(self, batch):
+        if self.ca_only:
+            x = batch["x_t"]
+        else:
+            x = rearrange(
+                batch["x_t"],
+                "b (n c) d -> b n c d",
+                c=4
+            )[..., 1, :]
         return bin_pairwise_distances(
-            x=batch["x_t"],
+            x=x,
             min_dist=self.min_dist,
             max_dist=self.max_dist,
             dim=self.dim,
@@ -545,9 +589,9 @@ class XscPairwiseDistancesPairFeat(Feature):
             )  # [b, n, n, pair_dist_dim]
         else:
             # If we do not provide self-conditioning as input to the nn
-            x = batch["x_t"]
-            b, n = x.shape[0], x.shape[1]
-            return torch.zeros(b, n, n, self.dim, device=x.device)
+            mask = batch["mask"]
+            b, n = mask.shape[0], mask.shape[1]
+            return torch.zeros(b, n, n, self.dim, device=mask.device)
 
 
 ####################################

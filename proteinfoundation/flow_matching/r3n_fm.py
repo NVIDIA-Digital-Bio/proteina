@@ -15,6 +15,7 @@ from typing import Callable, List, Literal, Optional, Tuple
 import torch
 from jaxtyping import Bool, Float
 from torch import Dict, Tensor
+from einops import rearrange
 from tqdm import tqdm
 
 from proteinfoundation.utils.align_utils.align_utils import mean_w_mask
@@ -32,13 +33,14 @@ class R3NFlowMatcher:
         self,
         zero_com: bool = False,
         scale_ref: float = 1.0,
+        dim = 3,
     ):
-        self.dim = 3
+        self.dim = dim
         self.scale_ref = scale_ref
         self.zero_com = zero_com
 
     def _force_zero_com(
-        self, x: Float[Tensor, "* n 3"], mask: Optional[Bool[Tensor, "* n"]] = None
+        self, x: Float[Tensor, "* n 3"], mask: Optional[Bool[Tensor, "* n"]] = None,
     ) -> Dict[str, Tensor]:
         """
         Centers tensor over n dimension.
@@ -408,6 +410,7 @@ class R3NFlowMatcher:
         cath_code: List[List[str]],
         device: torch.device,
         mask: Bool[Tensor, "* n"],
+        coords_mask: Bool[Tensor, "* nx4"],
         schedule_mode: Literal[
             "uniform", "power", "cos_sch_v_snr", "loglinear", "edm", "log"
         ],
@@ -453,7 +456,7 @@ class R3NFlowMatcher:
         Returns:
             Batch of generated samples [nsamples, n, ...]
         """
-        assert mask.shape == (nsamples, n)
+        assert coords_mask.shape == (nsamples, n), f"coords_mask.shape: {coords_mask.shape} != ({nsamples, n})"
 
         # Get discretization
         nsteps = math.ceil(
@@ -484,7 +487,7 @@ class R3NFlowMatcher:
 
         with torch.no_grad():
             x = self.sample_reference(
-                n, shape=(nsamples,), device=device, mask=mask, dtype=dtype
+                n, shape=(nsamples,), device=device, mask=coords_mask, dtype=dtype
             )  # [nsamples, n, 3]
             
             if fixed_sequence_mask is not None:
@@ -501,12 +504,14 @@ class R3NFlowMatcher:
                         "x_t": x,
                         "t": t,
                         "mask": mask,
+                        "coords_mask": coords_mask,
                     }
                 else:
                     nn_in = {
                         "x_t": x,
                         "t": t,
                         "mask": mask,
+                        "coords_mask": coords_mask,
                         "motif_mask": fixed_sequence_mask,
                         "fixed_structure_mask": fixed_structure_mask,
                         "x_motif": x_motif
@@ -515,7 +520,15 @@ class R3NFlowMatcher:
                 if cath_code is not None:
                     nn_in["cath_code"] = cath_code
                 if step > 0 and self_cond:
-                    nn_in["x_sc"] = x_1_pred  # Self-conditioning
+                    # Self-conditioning
+                    if mask.shape[-1] == coords_mask.shape[-1]:
+                        nn_in["x_sc"] = x_1_pred
+                    else:
+                        nn_in["x_sc"] = rearrange(
+                            x_1_pred,
+                            "b (n c) d -> b n c d",
+                            c=4
+                        )[..., 1, :]
 
                 x_1_pred, v = predict_clean_n_v(nn_in)
 
@@ -535,7 +548,7 @@ class R3NFlowMatcher:
                     sampling_mode=sampling_mode,
                     sc_scale_noise=sc_scale_noise,
                     sc_scale_score=sc_scale_score,
-                    mask=mask,
+                    mask=coords_mask,
                 )
             return x
 
