@@ -309,3 +309,4 @@ if __name__ == "__main__":
                 overwrite=True,
                 no_indexing=True,
             )
+            list_of_pdbs.append(dir_name)

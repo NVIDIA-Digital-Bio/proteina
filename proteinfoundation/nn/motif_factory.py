@@ -16,6 +16,7 @@ import random
 
 import biotite.structure.io as strucio
 from proteinfoundation.utils.align_utils.align_utils import mean_w_mask
+from proteinfoundation.utils.coors_utils import ang_to_nm
 
 import itertools
 
@@ -334,6 +335,7 @@ class SingleMotifFactory:
             x_1 = batch["x_1"]  # [b, n, 3]
         else:
             x_1 = batch["coords"][:,:,1,:]  # [b, n, 3]
+            x_1 = ang_to_nm(x_1)
         if "mask" in batch:
             mask = batch["mask"]
         else:
